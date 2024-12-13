@@ -22,3 +22,5 @@
 ### 1) Ensure you have Python installed on your system. Then open your terminal/command prompt and navigate to your project directory.
 ### 2) Verify virtual environment is active.
 ### 3) Install packages. 
+
+## Model building was done in Google Colab: https://colab.research.google.com/drive/1TmR7JA8DD5s2KYTjfcMMEV-oEA4BwNDl#scrollTo=sD7whiyRDIUU
