@@ -1,0 +1,156 @@
+!pip install rdkit-pypi
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import classification_report, roc_auc_score
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+# Step 1: Load Dataset
+def load_data(file_path):
+    """Loads and cleans the AMES test dataset."""
+    df = pd.read_csv(file_path)
+
+    # Clean dataset
+    df = df.iloc[1:]  # Skip the first row (header metadata)
+    df = df.rename(columns={
+        "Training set contains 7617 compounds": "SMILES",
+        "Unnamed: 1": "Label"
+    })
+
+    # Drop empty columns
+    df = df.drop(columns=[col for col in df.columns if "Unnamed" in col])
+
+    # Encode labels
+    label_encoder = LabelEncoder()
+    df["Label"] = label_encoder.fit_transform(df["Label"])
+
+    return df
+
+# Step 2: Generate Molecular Features
+def smiles_to_features(smiles_list):
+    """Converts SMILES strings into molecular fingerprints."""
+    features = []
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is not None:
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+            features.append(np.array(fp))
+        else:
+            features.append(np.zeros(2048))  # Placeholder for invalid SMILES
+    return np.array(features)
+
+# Step 3: Preprocess Data
+def preprocess_data(df, target_column):
+    """Preprocess the dataset by generating features, splitting, and scaling."""
+    X = smiles_to_features(df["SMILES"].tolist())  # Convert SMILES to features
+    
+    # Ensure labels are between 0 and 1
+    y = df[target_column].values.astype(np.float32)
+    y = np.clip(y, 0, 1)  # Clip values to be within 0 and 1
+    
+    # Split the dataset into training, validation, and test sets
+    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+    # Standardize features
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+    X_test = scaler.transform(X_test)
+
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+# Step 4: Define the Model
+class MutagenicActivityModel(nn.Module):
+    def __init__(self, input_dim):
+        super(MutagenicActivityModel, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.dropout1 = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(128, 64)
+        self.dropout2 = nn.Dropout(0.5)
+        self.output = nn.Linear(64, 1)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = self.dropout1(x)
+        x = torch.relu(self.fc2(x))
+        x = self.dropout2(x)
+        x = torch.sigmoid(self.output(x))
+        return x
+
+# Step 5: Train the Model
+def train_model(model, train_loader, val_loader, criterion, optimizer, device, epochs=50):
+    """Trains the model."""
+    model.to(device)
+    best_val_loss = float('inf')
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device).view(-1, 1)  # Flatten target tensor and ensure it has shape (batch_size, 1)
+
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            # Ensure outputs and y_batch have the same shape
+            outputs = outputs.view(-1)  
+            loss = criterion(outputs, y_batch.view(-1)) # Ensure y_batch is also flattened
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * X_batch.size(0)
+
+        train_loss /= len(train_loader.dataset)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device).view(-1, 1)  # Flatten target tensor and ensure it has shape (batch_size, 1)
+                outputs = model(X_batch)
+                # Ensure outputs and y_batch have the same shape
+                outputs = outputs.view(-1)  
+                loss = criterion(outputs, y_batch.view(-1))  # Ensure y_batch is also flattened
+                val_loss += loss.item() * X_batch.size(0)
+
+        val_loss /= len(val_loader.dataset)
+
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), "best_model.pth")
+
+# Step 6: Evaluate the Model
+def evaluate_model(model, test_loader, device):
+    """Evaluates the model and prints metrics."""
+    model.to(device)
+    model.eval()
+
+    all_predictions = []
+    all_labels = []
+
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device) 
+            outputs = model(X_batch)  
+            predictions = (outputs > 0.5).float()  
+            all_predictions.extend(predictions.cpu().numpy().flatten())  
+            all_labels.extend(y_batch.cpu().numpy().flatten()) 
+
+    print("Classification Report:")
+    print(classification_report(all_labels, all_predictions))
+
+    # Check for class imbalance before calculating AUC:
+    print("Unique labels in test set:", np.unique(all_labels))  
+    if len(np.unique(all_labels)) > 1:
+        auc = roc_auc_score(all_labels, all_predictions)
+        print(f"ROC AUC Score: {auc}")
+    else:
+        print("ROC AUC Score cannot be calculated: Only one class present in the labels.")
